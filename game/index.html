@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ember Duel — a card duel of four elements</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14100c; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Ember Duel: play numbered element cards against Cinder to reduce their life to zero"></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<script>
+'use strict';
+// Ember Duel — an original turn-based elemental card duel.
+// You vs Cinder, the Ash Warden. Both start at 30 life. Each round you play one
+// card from your hand of five; Cinder plays one back. Power = value (+2 when your
+// suit beats theirs). The stronger card deals the difference as damage (at least 1).
+// A Guard card blocks all damage that round. Ties deal nothing. First to 0 life loses.
+// Suits: Flame beats Leaf, Leaf beats Stone, Stone beats Tide, Tide beats Flame.
+// Keyboard: 1-5 play a card, Space/Enter start or restart, P pause, M mute, R restart.
+
+const FIELD = { width: 1280, height: 720 };
+const START_LIFE = 30;
+const HAND_SIZE = 5;
+
+const SUITS = {
+  flame: { name: 'Flame', glyph: '✦', color: '#e5534b', dark: '#7a241f', light: '#ffd9d4' },
+  tide:  { name: 'Tide',  glyph: '≋', color: '#4f9fd8', dark: '#1d4e79', light: '#d6eafb' },
+  leaf:  { name: 'Leaf',  glyph: '✿', color: '#58a34c', dark: '#2c5a24', light: '#dcf2d6' },
+  stone: { name: 'Stone', glyph: '◆', color: '#9a8c7a', dark: '#5c5347', light: '#efe8dd' },
+};
+const SUIT_KEYS = ['flame', 'tide', 'leaf', 'stone'];
+const BEATS = { flame: 'leaf', leaf: 'stone', stone: 'tide', tide: 'flame' };
+const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function buildDeck(random) {
+  const deck = [];
+  for (const suit of SUIT_KEYS) {
+    for (let v = 1; v <= 9; v += 1) deck.push({ suit, value: v, guard: false });
+    deck.push({ suit, value: 6, guard: true });
+    deck.push({ suit, value: 6, guard: true });
+  }
+  for (let i = deck.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    const t = deck[i]; deck[i] = deck[j]; deck[j] = t;
+  }
+  return deck;
+}
+
+function cardPower(card, foeCard) {
+  if (card.guard) return 0;
+  let p = card.value;
+  if (foeCard && !foeCard.guard && BEATS[card.suit] === foeCard.suit) p += 2;
+  return p;
+}
+function cardLabel(card) {
+  if (card.guard) return 'GUARD ' + SUITS[card.suit].name;
+  return card.value + ' ' + SUITS[card.suit].name;
+}
+
+function createGame(seed) {
+  const random = mulberry32(seed);
+  const game = {
+    screen: 'title', // title | play | paused | win | loss
+    round: 1, score: 0, roundsWon: 0,
+    playerLife: START_LIFE, aiLife: START_LIFE,
+    deck: [], discard: [],
+    playerHand: [], aiHand: [],
+    playerCard: null, aiCard: null,
+    result: '', log: [], muted: false,
+    hover: -1, selected: -1, flash: 0,
+  };
+
+  function drawTo(hand) {
+    while (hand.length < HAND_SIZE) {
+      if (game.deck.length === 0) {
+        if (game.discard.length === 0) break;
+        game.deck = game.discard.splice(0);
+        for (let i = game.deck.length - 1; i > 0; i -= 1) {
+          const j = Math.floor(random() * (i + 1));
+          const t = game.deck[i]; game.deck[i] = game.deck[j]; game.deck[j] = t;
+        }
+      }
+      hand.push(game.deck.pop());
+    }
+  }
+
+  function reset() {
+    game.deck = buildDeck(random);
+    game.discard = [];
+    game.playerHand = []; game.aiHand = [];
+    game.playerLife = START_LIFE; game.aiLife = START_LIFE;
+    game.round = 1; game.score = 0; game.roundsWon = 0;
+    game.playerCard = null; game.aiCard = null; game.result = '';
+    game.log = ['Cinder shuffles the ember deck. Your move, duelist.'];
+    drawTo(game.playerHand); drawTo(game.aiHand);
+  }
+
+  function aiPick(foeCard) {
+    let best = 0; let bestScore = -Infinity;
+    for (let i = 0; i < game.aiHand.length; i += 1) {
+      const c = game.aiHand[i];
+      const p = cardPower(c, foeCard);
+      const s = p + random() * 1.5 + (c.guard && foeCard && !foeCard.guard ? 1.5 : 0);
+      if (s > bestScore) { bestScore = s; best = i; }
+    }
+    return best;
+  }
+
+  function playCard(index) {
+    if (game.screen !== 'play' || index < 0 || index >= game.playerHand.length) return;
+    const mine = game.playerHand.splice(index, 1)[0];
+    const aiIndex = aiPick(mine);
+    const theirs = game.aiHand.splice(aiIndex, 1)[0];
+    game.playerCard = mine; game.aiCard = theirs;
+    const myPower = cardPower(mine, theirs);
+    const theirPower = cardPower(theirs, mine);
+    let text = '';
+    if (mine.guard && theirs.guard) {
+      text = 'Both guard — no damage.';
+    } else if (mine.guard) {
+      text = 'You guard! Cinder\'s ' + cardLabel(theirs) + ' is blocked.';
+    } else if (theirs.guard) {
+      text = 'Cinder guards! Your ' + cardLabel(mine) + ' is blocked.';
+    } else if (myPower > theirPower) {
+      const dmg = myPower - theirPower;
+      game.aiLife = Math.max(0, game.aiLife - dmg);
+      game.score += dmg + 5; game.roundsWon += 1;
+      text = 'You win the round! ' + cardLabel(mine) + ' (' + myPower + ') beats ' +
+        cardLabel(theirs) + ' (' + theirPower + ') — ' + dmg + ' damage to Cinder.';
+      beep(660, 0.12);
+    } else if (theirPower > myPower) {
+      const dmg = theirPower - myPower;
+      game.playerLife = Math.max(0, game.playerLife - dmg);
+      text = 'Cinder wins the round. ' + cardLabel(theirs) + ' (' + theirPower + ') beats ' +
+        cardLabel(mine) + ' (' + myPower + ') — ' + dmg + ' damage to you.';
+      beep(220, 0.18);
+    } else {
+      text = 'Tie! ' + cardLabel(mine) + ' meets ' + cardLabel(theirs) + ' — no damage.';
+      beep(440, 0.08);
+    }
+    game.result = text;
+    game.log.push('Round ' + game.round + ': ' + text);
+    if (game.log.length > 4) game.log.shift();
+    game.discard.push(mine, theirs);
+    game.round += 1;
+    drawTo(game.playerHand); drawTo(game.aiHand);
+    if (game.aiLife <= 0) { game.screen = 'win'; fanfare(); }
+    else if (game.playerLife <= 0) { game.screen = 'loss'; beep(160, 0.4); }
+  }
+
+  let audio = null;
+  function beep(freq, dur) {
+    if (game.muted) return;
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audio.createOscillator(); const g = audio.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.08, audio.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + dur);
+      o.connect(g); g.connect(audio.destination);
+      o.start(); o.stop(audio.currentTime + dur);
+    } catch (e) { /* sound is optional */ }
+  }
+  function fanfare() {
+    if (game.muted) return;
+    [523, 659, 784].forEach((f, i) => setTimeout(() => beep(f, 0.2), i * 140));
+  }
+
+  reset();
+  return { game, reset, playCard, beep };
+}
+
+// ---------- rendering ----------
+const canvas = document.getElementById('game');
+const status = document.getElementById('status');
+const ctx = canvas.getContext('2d');
+const params = new URLSearchParams(window.location.search);
+const shot = params.get('shot');
+const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
+const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const { game, reset, playCard } = createGame(seed);
+
+const view = { scale: 1, x: 0, y: 0 };
+function resize() {
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(window.innerWidth * ratio);
+  canvas.height = Math.round(window.innerHeight * ratio);
+  view.scale = Math.min(canvas.width / FIELD.width, canvas.height / FIELD.height);
+  view.x = (canvas.width - FIELD.width * view.scale) / 2;
+  view.y = (canvas.height - FIELD.height * view.scale) / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const CARD = { w: 112, h: 140, gap: 14 };
+function handX(i, n) {
+  const total = n * CARD.w + (n - 1) * CARD.gap;
+  return (FIELD.width - total) / 2 + i * (CARD.w + CARD.gap);
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function text(str, x, y, size, color, align, bold) {
+  ctx.font = (bold ? '700 ' : '') + size + 'px ' + FONT;
+  ctx.fillStyle = color;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(str, x, y);
+}
+function lifeBar(x, y, w, life, max, color) {
+  ctx.fillStyle = '#2a2118';
+  roundRect(x, y, w, 22, 6); ctx.fill();
+  ctx.fillStyle = color;
+  const frac = Math.max(0, life / max);
+  if (frac > 0) { roundRect(x + 2, y + 2, (w - 4) * frac, 18, 4); ctx.fill(); }
+}
+function drawCard(card, x, y, faceDown, hover) {
+  ctx.save();
+  if (hover) { ctx.translate(0, -10); ctx.shadowColor = '#f2c94c'; ctx.shadowBlur = 18; }
+  const s = SUITS[card.suit];
+  if (faceDown) {
+    ctx.fillStyle = '#3a2c1e'; roundRect(x, y, CARD.w, CARD.h, 10); ctx.fill();
+    ctx.strokeStyle = '#f2c94c'; ctx.lineWidth = 2;
+    roundRect(x + 5, y + 5, CARD.w - 10, CARD.h - 10, 8); ctx.stroke();
+    text('✦', x + CARD.w / 2, y + CARD.h / 2 + 12, 34, '#f2c94c', 'center');
+  } else {
+    ctx.fillStyle = '#f7f1e5'; roundRect(x, y, CARD.w, CARD.h, 10); ctx.fill();
+    ctx.strokeStyle = s.dark; ctx.lineWidth = 3;
+    roundRect(x, y, CARD.w, CARD.h, 10); ctx.stroke();
+    ctx.fillStyle = s.color; roundRect(x, y, CARD.w, 34, 10); ctx.fill();
+    ctx.fillRect(x, y + 24, CARD.w, 10);
+    text(card.guard ? 'GUARD' : SUITS[card.suit].name.toUpperCase(), x + CARD.w / 2, y + 24, 15, '#fff', 'center', true);
+    if (card.guard) {
+      ctx.fillStyle = s.dark;
+      ctx.beginPath();
+      ctx.moveTo(x + CARD.w / 2, y + 48);
+      ctx.lineTo(x + CARD.w / 2 + 26, y + 58);
+      ctx.lineTo(x + CARD.w / 2 + 26, y + 82);
+      ctx.quadraticCurveTo(x + CARD.w / 2 + 26, y + 102, x + CARD.w / 2, y + 112);
+      ctx.quadraticCurveTo(x + CARD.w / 2 - 26, y + 102, x + CARD.w / 2 - 26, y + 82);
+      ctx.lineTo(x + CARD.w / 2 - 26, y + 58);
+      ctx.closePath(); ctx.fill();
+      text('6', x + CARD.w / 2, y + 94, 26, '#fff', 'center', true);
+    } else {
+      text(String(card.value), x + CARD.w / 2, y + 86, 52, s.dark, 'center', true);
+    }
+    text(s.glyph, x + CARD.w / 2, y + 118, 26, s.color, 'center');
+    text(card.guard ? 'Blocks 6' : 'Power ' + card.value, x + CARD.w / 2, y + 134, 12, '#6b5d4a', 'center');
+  }
+  ctx.restore();
+}
+function drawPanel(title, lines, prompt, accent) {
+  const w = 640; const h = 150 + lines.length * 34;
+  const x = (FIELD.width - w) / 2; const y = (FIELD.height - h) / 2;
+  ctx.fillStyle = 'rgba(20,14,8,0.92)'; roundRect(x, y, w, h, 16); ctx.fill();
+  ctx.strokeStyle = accent || '#f2c94c'; ctx.lineWidth = 3;
+  roundRect(x, y, w, h, 16); ctx.stroke();
+  text(title, FIELD.width / 2, y + 72, 46, '#f7f1e5', 'center', true);
+  lines.forEach((ln, i) => text(ln, FIELD.width / 2, y + 118 + i * 34, 20, '#d8cbb2', 'center'));
+  text(prompt, FIELD.width / 2, y + h - 30, 21, '#f2c94c', 'center', true);
+}
+
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#14100c'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
+  // felt table
+  ctx.fillStyle = '#1e4d2e'; roundRect(16, 16, FIELD.width - 32, FIELD.height - 32, 24); ctx.fill();
+  ctx.strokeStyle = '#f2c94c'; ctx.lineWidth = 3;
+  roundRect(16, 16, FIELD.width - 32, FIELD.height - 32, 24); ctx.stroke();
+
+  // top bar
+  text('EMBER DUEL', 40, 52, 30, '#f2c94c', 'left', true);
+  text('Round ' + game.round, FIELD.width / 2, 52, 24, '#f7f1e5', 'center');
+  text('Score ' + game.score, FIELD.width - 40, 52, 24, '#f7f1e5', 'right');
+
+  // opponent
+  text('CINDER — the Ash Warden', 40, 96, 20, '#e8a49e', 'left', true);
+  lifeBar(40, 106, 260, game.aiLife, START_LIFE, '#e5534b');
+  text('Life ' + game.aiLife + ' / ' + START_LIFE, 312, 124, 20, '#f7f1e5', 'left', true);
+  game.aiHand.forEach((c, i) => drawCard(c, handX(i, game.aiHand.length), 130, true, false));
+  text('Cinder\'s hand', FIELD.width - 40, 140, 15, '#d8cbb2', 'right');
+
+  // centre: last played cards (only during play; panels cover it on title/end screens)
+  const inGame = game.screen === 'play' || game.screen === 'paused';
+  if (inGame && game.playerCard && game.aiCard) {
+    drawCard(game.playerCard, FIELD.width / 2 - CARD.w - 40, 288, false, false);
+    text('VS', FIELD.width / 2, 368, 30, '#f2c94c', 'center', true);
+    drawCard(game.aiCard, FIELD.width / 2 + 40, 288, false, false);
+    text(game.result, FIELD.width / 2, 462, 19, '#f7f1e5', 'center');
+    text(game.log[game.log.length - 1] || '', FIELD.width / 2, 488, 15, '#b8a98d', 'center');
+  } else if (inGame) {
+    text('Play a card to duel Cinder.', FIELD.width / 2, 360, 22, '#d8cbb2', 'center');
+    text('Higher power wins the round. Suit beats: Flame > Leaf > Stone > Tide > Flame (+2).', FIELD.width / 2, 392, 17, '#b8a98d', 'center');
+  }
+
+  // player
+  text('YOU', 40, 522, 20, '#9fd0f2', 'left', true);
+  lifeBar(40, 530, 260, game.playerLife, START_LIFE, '#4f9fd8');
+  text('Life ' + game.playerLife + ' / ' + START_LIFE, 312, 548, 20, '#f7f1e5', 'left', true);
+  text('Click a card or press 1–5  •  P pause  •  M mute', FIELD.width - 40, 548, 15, '#d8cbb2', 'right');
+  game.playerHand.forEach((c, i) => drawCard(c, handX(i, game.playerHand.length), 560, false, i === game.hover));
+
+  if (game.screen === 'title') {
+    drawPanel('EMBER DUEL', [
+      'A duel of four elements against Cinder.',
+      'Higher power wins the round and deals the difference.',
+      'Flame > Leaf > Stone > Tide > Flame (+2). Guard blocks.',
+      'First to 0 life loses. You start with 30 life.',
+    ], 'Press Space or click to start', '#f2c94c');
+  } else if (game.screen === 'paused') {
+    drawPanel('PAUSED', ['The embers wait for you.'], 'Press P to resume', '#9fd0f2');
+  } else if (game.screen === 'win') {
+    drawPanel('VICTORY!', [
+      'Cinder\'s life is 0. The ember table is yours.',
+      'Score ' + game.score + '  •  Rounds won ' + game.roundsWon + '  •  Life left ' + game.playerLife,
+    ], 'Press Space or click to play again', '#58a34c');
+  } else if (game.screen === 'loss') {
+    drawPanel('DEFEAT', [
+      'Your life is 0. Cinder keeps the ember table… this time.',
+      'Score ' + game.score + '  •  Rounds won ' + game.roundsWon,
+    ], 'Press Space or click to try again', '#e5534b');
+  }
+}
+
+// ---------- input ----------
+function announce(msg) { status.textContent = msg; }
+function toField(e) {
+  const r = canvas.getBoundingClientRect();
+  const cx = (e.clientX - r.left) * (canvas.width / r.width);
+  const cy = (e.clientY - r.top) * (canvas.height / r.height);
+  return { x: (cx - view.x) / view.scale, y: (cy - view.y) / view.scale };
+}
+function cardAt(p) {
+  for (let i = 0; i < game.playerHand.length; i += 1) {
+    const x = handX(i, game.playerHand.length), y = 560;
+    if (p.x >= x && p.x <= x + CARD.w && p.y >= y && p.y <= y + CARD.h) return i;
+  }
+  return -1;
+}
+canvas.addEventListener('pointermove', (e) => {
+  game.hover = game.screen === 'play' ? cardAt(toField(e)) : -1;
+});
+canvas.addEventListener('pointerdown', (e) => {
+  if (game.screen === 'title' || game.screen === 'win' || game.screen === 'loss') {
+    reset(); game.screen = 'play'; announce('Playing. 30 life each.');
+  } else if (game.screen === 'play') {
+    const i = cardAt(toField(e));
+    if (i >= 0) playCard(i);
+  }
+});
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'Enter') {
+    if (game.screen === 'title' || game.screen === 'win' || game.screen === 'loss') {
+      reset(); game.screen = 'play'; announce('Playing. 30 life each.');
+    }
+    e.preventDefault();
+  } else if (e.code === 'KeyP' || e.code === 'Escape') {
+    if (game.screen === 'play') { game.screen = 'paused'; announce('Paused.'); }
+    else if (game.screen === 'paused') { game.screen = 'play'; announce('Playing.'); }
+  } else if (e.code === 'KeyM') { game.muted = !game.muted; }
+  else if (e.code === 'KeyR') { reset(); game.screen = 'play'; }
+  else if (game.screen === 'play' && /^Digit[1-5]$/.test(e.code)) {
+    playCard(Number(e.code.slice(5)) - 1);
+  }
+});
+
+// ---------- screenshot staging ----------
+function stageShot(name) {
+  reset();
+  if (name === 'play') {
+    // a real mid-game: play four scripted rounds from a fixed seed
+    game.screen = 'play';
+    const order = [4, 0, 3, 1];
+    order.forEach((idx) => { if (game.screen === 'play' && game.playerHand[idx]) playCard(idx); });
+    if (game.screen !== 'play') { reset(); game.screen = 'play'; game.playerLife = 24; game.aiLife = 18; game.round = 5; game.score = 23; game.roundsWon = 3; game.result = 'You win the round! 8 Flame (10) beats 6 Leaf (6) — 4 damage to Cinder.'; game.log = ['Round 4: You win the round! 8 Flame (10) beats 6 Leaf (6) — 4 damage to Cinder.']; }
+  } else if (name === 'win') {
+    game.screen = 'play'; game.aiLife = 2; game.playerLife = 19; game.round = 8; game.score = 41; game.roundsWon = 5;
+    const strong = game.playerHand.findIndex((c) => !c.guard && c.value >= 7);
+    if (strong >= 0) playCard(strong);
+    if (game.screen !== 'win') { game.aiLife = 0; game.screen = 'win'; }
+  } else if (name === 'loss') {
+    game.screen = 'play'; game.playerLife = 2; game.aiLife = 21; game.round = 8; game.score = 18; game.roundsWon = 2;
+    const weak = game.playerHand.findIndex((c) => !c.guard && c.value <= 3);
+    if (weak >= 0) playCard(weak);
+    if (game.screen !== 'loss') { game.playerLife = 0; game.screen = 'loss'; }
+  } else {
+    game.screen = 'title';
+  }
+}
+
+if (shot) {
+  stageShot(shot);
+  let painted = 0;
+  (function paint() {
+    draw();
+    painted += 1;
+    if (painted < 2) requestAnimationFrame(paint);
+    else window.__shotReady = true;
+  })();
+} else {
+  announce('Ember Duel. Press Space or click to start.');
+  (function frame() {
+    requestAnimationFrame(frame);
+    draw();
+  })();
+}
+</script>
+</body>
+</html>
